@@ -169,33 +169,95 @@ def cursor_pos():
     return p.x, p.y
 
 
-def _ease(t):
-    return 4 * t * t * t if t < 0.5 else 1 - pow(-2 * t + 2, 3) / 2.0
-
-
 _RNG = random.Random()
 
 
-def move_to(x, y, duration_ms=420, human=True):
+def _ease(t):
+    """对称缓动，只在 --no-human 模式下用。"""
+    return 4 * t * t * t if t < 0.5 else 1 - pow(-2 * t + 2, 3) / 2.0
+
+
+def _tremor_series(n, rng, amp=1.0, knot_span=20):
+    """生成低频相关噪声，模拟生理性手抖。
+
+    关键：真人生理性手抖是 8~12Hz，不是逐步白噪声。
+    如果每个采样点都换一个新随机值，抖动频率会到 200Hz——
+    看起来像鼠标坏了，不像人手。
+    所以这里每 knot_span 个采样点才取一个新随机值，中间线性插值。
+    """
+    knots = [rng.gauss(0, amp)]
+    need = n // knot_span + 3
+    while len(knots) < need:
+        knots.append(knots[-1] * 0.58 + rng.gauss(0, amp * 0.85))
+    out = []
+    for i in range(n):
+        t = i / float(knot_span)
+        k = int(t)
+        f = t - k
+        if k + 1 >= len(knots):
+            out.append(knots[-1])
+        else:
+            out.append(knots[k] * (1.0 - f) + knots[k + 1] * f)
+    return out
+
+
+def _asym_ease(t):
+    """非对称速度曲线：加速快、减速慢，接近真人肢体运动。"""
+    if t < 0.5:
+        return pow(t * 2.0, 0.62) / 2.0
+    return 1.0 - pow((1.0 - t) * 2.0, 1.55) / 2.0
+
+
+def _submove(x0, y0, x1, y1, rng, bow_scale=0.06, bow_max=22.0):
+    """一段子运动的采样点：二次贝塞尔 + 非对称速度曲线。"""
+    dx, dy = x1 - x0, y1 - y0
+    dist = math.hypot(dx, dy)
+    if dist < 0.6:
+        return [(x1, y1)]
+    ang = math.atan2(dy, dx)
+    perp = ang + math.pi / 2.0
+    bow = rng.gauss(0, min(dist * bow_scale, bow_max))
+    cx = (x0 + x1) / 2.0 + math.cos(perp) * bow
+    cy = (y0 + y1) / 2.0 + math.sin(perp) * bow
+    n = max(3, min(56, int(dist / 7.0) + 3))
+    pts = []
+    for i in range(1, n + 1):
+        e = _asym_ease(i / float(n))
+        u = 1.0 - e
+        pts.append((u * u * x0 + 2 * u * e * cx + e * e * x1,
+                    u * u * y0 + 2 * u * e * cy + e * e * y1))
+    return pts
+
+
+def auto_duration(dist):
+    """按距离估算真人移动耗时。真人搬鼠标不是匀速的。"""
+    ms = 170.0 + dist * 0.42
+    return max(200.0, min(1150.0, ms))
+
+
+def move_to(x, y, duration_ms=-1, human=True):
     """移动鼠标。
 
-    human=True 时加入真人熵：
-      · 二次贝塞尔弯曲路径（不是直线）
-      · 长距离时轻微过冲，再回正
-      · 每一步加高斯微抖，模拟手部震颤
-      · 步间耗时抖动 + 偶发微停顿
-      · 最终精确落到目标点，保证点击准确
+    human=True 时按真人运动模型走，包含四个特征：
+      1. 反应延迟  —— 决定移动之后，手不会立刻动
+      2. 多段子运动 —— 粗定位 → 修正 → 微调，每段幅度递减
+      3. 非对称速度 —— 加速快、减速慢，不是对称缓动
+      4. 相关手抖   —— 平滑随机游走，不是白噪声
+    最后落点会精确修正到目标，保证点击不偏。
     """
     x, y = int(x), int(y)
-    if not duration_ms or duration_ms <= 0:
+    if duration_ms == 0:
         u32.SetCursorPos(x, y)
         return
 
     x0, y0 = cursor_pos()
     dist = math.hypot(x - x0, y - y0)
-    if dist < 3:
+    if dist < 2:
         u32.SetCursorPos(x, y)
         return
+
+    if duration_ms is None or duration_ms < 0:
+        duration_ms = auto_duration(dist)
 
     if not human:
         steps = max(10, min(80, int(dist / 8) + 10))
@@ -206,46 +268,62 @@ def move_to(x, y, duration_ms=420, human=True):
         u32.SetCursorPos(x, y)
         return
 
-    ang = math.atan2(y - y0, x - x0)
-    # 过冲：只有中长距离才出现，短距离不做
-    over = _RNG.uniform(0.03, 0.10) * dist if dist > 140 else 0.0
-    tx = x + math.cos(ang) * over
-    ty = y + math.sin(ang) * over
-    # 弯曲：垂直于行进方向偏移控制点
-    perp = ang + math.pi / 2.0
-    bow = _RNG.gauss(0, min(dist * 0.05, 26.0))
-    cx = (x0 + tx) / 2.0 + math.cos(perp) * bow
-    cy = (y0 + ty) / 2.0 + math.sin(perp) * bow
+    rng = _RNG
+    total_s = duration_ms / 1000.0
 
-    steps = max(12, min(85, int(dist / 8) + 12))
-    base_sleep = duration_ms / 1000.0 / steps
-    jitter = 1.1 if dist > 60 else 0.55
+    # 1) 反应延迟：决定移动之后手不会立刻动
+    time.sleep(rng.uniform(0.045, 0.16))
 
-    for i in range(1, steps + 1):
-        t = _ease(i / float(steps))
-        u = 1.0 - t
-        px = u * u * x0 + 2 * u * t * cx + t * t * tx
-        py = u * u * y0 + 2 * u * t * cy + t * t * ty
-        px += _RNG.gauss(0, jitter)
-        py += _RNG.gauss(0, jitter)
-        u32.SetCursorPos(int(round(px)), int(round(py)))
-        sl = base_sleep * (1.0 + _RNG.gauss(0, 0.20))
-        time.sleep(max(0.0008, sl))
-        if _RNG.random() < 0.045:          # 偶发微停顿
-            time.sleep(_RNG.uniform(0.012, 0.045))
+    # 2) 子运动计划：每段覆盖"剩余距离"的固定比例。
+    #    关键是后段距离越来越小、但时间占比不按比例缩，
+    #    速度就自然降下来了——这才是真人"减速逼近"的手感。
+    #    如果距离和时间一起缩，全程匀速，一眼假。
+    if dist > 620:
+        plan = [0.86, 0.86, 0.86, 1.0]
+        shares = [0.50, 0.27, 0.15, 0.08]
+    elif dist > 210:
+        plan = [0.87, 0.87, 1.0]
+        shares = [0.60, 0.26, 0.14]
+    else:
+        plan = [0.88, 1.0]
+        shares = [0.72, 0.28]
+    # 每个比例加随机扰动，避免每次轨迹长得一模一样
+    plan = [1.0 if p >= 1.0 else min(0.97, max(0.60, p * rng.uniform(0.94, 1.06)))
+            for p in plan]
 
-    # 过冲回正
-    if over > 0:
-        for i in range(1, 5):
-            t = i / 4.0
-            u32.SetCursorPos(int(round(tx + (x - tx) * t + _RNG.gauss(0, 0.7))),
-                             int(round(ty + (y - ty) * t + _RNG.gauss(0, 0.7))))
-            time.sleep(_RNG.uniform(0.012, 0.032))
+    tremor = _tremor_series(700, rng, amp=0.55 + min(dist / 1400.0, 1.0),
+                            knot_span=rng.randint(16, 26))
+    ti = 0
+    cur = (float(x0), float(y0))
 
-    u32.SetCursorPos(x, y)                  # 精确落点，保证点击不偏
+    for k, frac in enumerate(plan):
+        tx = cur[0] + (x - cur[0]) * frac
+        ty = cur[1] + (y - cur[1]) * frac
+        pts = _submove(cur[0], cur[1], tx, ty, rng,
+                       bow_scale=0.075 if k == 0 else 0.05,
+                       bow_max=26.0 if k == 0 else 12.0)
+        seg_s = total_s * shares[k]
+        per = seg_s / len(pts)
+        for (px, py) in pts:
+            t = tremor[ti % len(tremor)]
+            ti += 1
+            u32.SetCursorPos(int(round(px + t)), int(round(py + t * 0.62)))
+            time.sleep(max(0.0006, per * (1.0 + rng.gauss(0, 0.13))))
+        cur = (tx, ty)
+        # 段与段之间短暂停顿：真人修正前会"看一下"
+        if k < len(plan) - 1:
+            time.sleep(rng.uniform(0.022, 0.070))
+
+    # 3) 落点微调：最后 1~3 次极小幅修正，而不是"啪"地吸附
+    for i in range(rng.randint(1, 3)):
+        jx = _RNG.gauss(0, 0.9)
+        jy = _RNG.gauss(0, 0.9)
+        u32.SetCursorPos(int(round(x + jx)), int(round(y + jy)))
+        time.sleep(rng.uniform(0.012, 0.034))
+    u32.SetCursorPos(x, y)
 
 
-def move_rel(dx, dy, duration_ms=420, human=True):
+def move_rel(dx, dy, duration_ms=-1, human=True):
     x, y = cursor_pos()
     move_to(x + dx, y + dy, duration_ms, human)
 
@@ -638,12 +716,12 @@ def main():
     p.add_argument("x", type=int, nargs="?")
     p.add_argument("y", type=int, nargs="?")
     p.add_argument("--rel", nargs=2, type=int, metavar=("DX", "DY"))
-    p.add_argument("--duration", type=int, default=420)
+    p.add_argument("--duration", type=int, default=-1, help="移动耗时ms，-1=按距离自动，0=瞬移")
 
     p = sub.add_parser("hover", help="移到目标悬停，不点击")
     p.add_argument("--x", type=int, required=True)
     p.add_argument("--y", type=int, required=True)
-    p.add_argument("--duration", type=int, default=420)
+    p.add_argument("--duration", type=int, default=-1, help="移动耗时ms，-1=按距离自动，0=瞬移")
     p.add_argument("--hold", type=float, default=0.3, help="悬停保持秒数")
 
     for name in ("click", "rclick", "dclick", "mclick"):
@@ -652,7 +730,7 @@ def main():
         p.add_argument("--x", type=int)
         p.add_argument("--y", type=int)
         p.add_argument("--count", type=int)
-        p.add_argument("--move", type=int, default=420)
+        p.add_argument("--move", type=int, default=-1, help="移向目标耗时ms，-1=自动")
         add_win_args(p)
         p.add_argument("--rx", type=int, help="窗口内相对 X（相对客户区左上角）")
         p.add_argument("--ry", type=int, help="窗口内相对 Y")
@@ -664,8 +742,8 @@ def main():
     p.add_argument("x2", type=int)
     p.add_argument("y2", type=int)
     p.add_argument("--button", default="left", choices=list(BTN))
-    p.add_argument("--duration", type=int, default=650)
-    p.add_argument("--move", type=int, default=420)
+    p.add_argument("--duration", type=int, default=-1, help="拖动耗时ms，-1=自动")
+    p.add_argument("--move", type=int, default=-1, help="移向目标耗时ms，-1=自动")
 
     p = sub.add_parser("down", help="按住鼠标键不放")
     p.add_argument("--button", default="left", choices=list(BTN))
@@ -676,7 +754,7 @@ def main():
     p.add_argument("amount", type=int)
     p.add_argument("--x", type=int)
     p.add_argument("--y", type=int)
-    p.add_argument("--move", type=int, default=420)
+    p.add_argument("--move", type=int, default=-1, help="移向目标耗时ms，-1=自动")
 
     p = sub.add_parser("type", help="输入文本")
     p.add_argument("text")
