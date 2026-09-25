@@ -167,4 +167,4 @@ python scripts/cc.py screen
 
 ## 许可
 
-MIT，见 [LICENSE](LICENSE)。
+**0BSD**（Zero-Clause BSD）—— 想怎么用就怎么用：改、卖、闭源分发都行。**没有任何条件，也不要求署名。** 见 [LICENSE](LICENSE)。

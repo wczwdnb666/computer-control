@@ -174,4 +174,4 @@ Things that fail *silently* if you get them wrong:
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+**0BSD** — the Zero-Clause BSD license. Do whatever you want with this: use it, modify it, sell it, ship it closed-source. There is no attribution requirement and no conditions of any kind. See [LICENSE](LICENSE).
