@@ -671,6 +671,133 @@ def set_window_state(hwnd, action):
         raise SystemExit("未知动作: %s" % action)
 
 
+# ---------------- UI Automation（元素定位） ----------------
+# 可选增强：装了 uiautomation 就能按控件名/类型定位，不必靠坐标。
+# 没装也能用，只是退回到坐标点击。
+_uia = None
+_uia_err = None
+
+INTERACTIVE_TYPES = {
+    "EditControl", "ButtonControl", "ComboBoxControl", "CheckBoxControl",
+    "RadioButtonControl", "ListItemControl", "MenuItemControl",
+    "HyperlinkControl", "DocumentControl", "TabItemControl",
+    "TreeItemControl", "TextControl", "SplitButtonControl", "SpinnerControl",
+}
+
+
+def uia():
+    """惰性加载 uiautomation。返回模块，不可用时返回 None。"""
+    global _uia, _uia_err
+    if _uia is not None or _uia_err is not None:
+        return _uia
+    try:
+        import uiautomation as _m
+        _uia = _m
+    except Exception as e:
+        _uia_err = str(e)
+    return _uia
+
+
+def _uia_window(title=None, proc=None, cls=None):
+    """按标题/进程名找一个 UIA 窗口对象。"""
+    m = uia()
+    if m is None:
+        return None, "uiautomation 未安装"
+    root = m.GetRootControl()
+    cands = []
+    for w in root.GetChildren():
+        try:
+            nm = w.Name or ""
+            pid = w.ProcessId
+            pname = proc_name(pid)
+            if title and title.lower() not in nm.lower():
+                continue
+            if proc and proc.lower() not in pname.lower():
+                continue
+            if cls and cls.lower() not in (w.ClassName or "").lower():
+                continue
+            cands.append((0 if nm else 1, w, nm, pname))
+        except Exception:
+            continue
+    if not cands:
+        return None, "没找到匹配的窗口"
+    cands.sort(key=lambda x: x[0])   # 优先有标题的窗口
+    return cands[0][1], None
+
+
+def _uia_walk(ctrl, max_depth=8, limit=4000):
+    """广度优先遍历，返回 (深度, 控件) 列表。"""
+    out = []
+    stack = [(ctrl, 0)]
+    while stack and len(out) < limit:
+        c, d = stack.pop(0)
+        out.append((d, c))
+        if d >= max_depth:
+            continue
+        try:
+            for ch in c.GetChildren():
+                stack.append((ch, d + 1))
+        except Exception:
+            pass
+    return out
+
+
+def _uia_find(title=None, proc=None, cls=None, name=None, ctype=None,
+              auto_id=None, contains=True, limit=20):
+    """在指定窗口内查找元素。
+
+    name 匹配控件名，ctype 匹配控件类型（如 EditControl）。
+    """
+    win, err = _uia_window(title, proc, cls)
+    if win is None:
+        return [], err
+    hits = []
+    for d, c in _uia_walk(win):
+        try:
+            cn = c.ControlTypeName
+            nm = c.Name or ""
+            aid = ""
+            try:
+                aid = c.AutomationId or ""
+            except Exception:
+                pass
+            if ctype and cn.lower() != ctype.lower():
+                continue
+            if name:
+                if contains:
+                    if name.lower() not in nm.lower():
+                        continue
+                else:
+                    if name.lower() != nm.lower():
+                        continue
+            if auto_id and auto_id.lower() not in aid.lower():
+                continue
+            if not (name or ctype or auto_id):
+                # 没给条件时只列可交互元素
+                if cn not in INTERACTIVE_TYPES:
+                    continue
+            r = c.BoundingRectangle
+            w, h = r.right - r.left, r.bottom - r.top
+            if w <= 0 or h <= 0:
+                continue
+            hits.append(dict(depth=d, name=nm, ctype=cn, auto_id=aid,
+                             x=r.left, y=r.top, w=w, h=h,
+                             cx=r.left + w // 2, cy=r.top + h // 2,
+                             enabled=bool(getattr(c, "IsEnabled", True)),
+                             ctrl=c))
+            if len(hits) >= limit:
+                break
+        except Exception:
+            continue
+    return hits, None
+
+
+def _uia_describe(h):
+    return "%-18s %-36s @(%d,%d %dx%d)%s" % (
+        h["ctype"], (h["name"] or "(无名)")[:34], h["x"], h["y"], h["w"], h["h"],
+        "" if h["enabled"] else "  [禁用]")
+
+
 # ---------------- 截图 ----------------
 def screenshot(path, region=None, grid=0, maxw=0, scale=1.0):
     try:
@@ -827,6 +954,43 @@ def main():
     add_win_args(p)
     p.add_argument("--action", required=True,
                    choices=["min", "max", "restore", "close", "top"])
+
+    # ---- 元素定位（需要可选依赖 uiautomation） ----
+    p = sub.add_parser("tree", help="打印窗口的元素树（元素定位用）")
+    add_win_args(p)
+    p.add_argument("--interactive", action="store_true",
+                   help="只列可交互元素（输入框/按钮等），不打印全部")
+    p.add_argument("--depth", type=int, default=8)
+
+    p = sub.add_parser("find", help="按名称/类型查找界面元素")
+    add_win_args(p)
+    p.add_argument("--name", help="控件名，模糊匹配")
+    p.add_argument("--type", dest="ctype", help="控件类型，如 EditControl / ButtonControl")
+    p.add_argument("--auto-id", help="AutomationId，模糊匹配")
+    p.add_argument("--exact", action="store_true", help="名称精确匹配")
+    p.add_argument("--limit", type=int, default=20)
+
+    p = sub.add_parser("click-el", help="定位元素并点击它（比坐标点击可靠）")
+    add_win_args(p)
+    p.add_argument("--name")
+    p.add_argument("--type", dest="ctype")
+    p.add_argument("--auto-id")
+    p.add_argument("--exact", action="store_true")
+    p.add_argument("--index", type=int, default=0, help="命中多个时取第几个")
+    p.add_argument("--button", default="left", choices=list(BTN))
+    p.add_argument("--count", type=int, default=1)
+
+    p = sub.add_parser("set-el", help="定位元素并输入文本")
+    add_win_args(p)
+    p.add_argument("text")
+    p.add_argument("--name")
+    p.add_argument("--type", dest="ctype")
+    p.add_argument("--auto-id")
+    p.add_argument("--exact", action="store_true")
+    p.add_argument("--index", type=int, default=0)
+    p.add_argument("--clear", action="store_true", help="先全选清空")
+    p.add_argument("--paste", action="store_true",
+                   help="走剪贴板粘贴（长文本推荐）")
 
     a = ap.parse_args()
     dry = a.dry_run
@@ -1088,6 +1252,106 @@ def main():
         set_window_state(w["hwnd"], a.action)
         time.sleep(0.4)
         print("已对「%s」执行 %s" % (w["title"] or w["proc"], a.action))
+
+    elif a.cmd == "tree":
+        if uia() is None:
+            print("需要可选依赖：pip install uiautomation")
+            sys.exit(6)
+        win, err = _uia_window(a.win, a.process, a.cls)
+        if win is None:
+            print("✗", err)
+            sys.exit(3)
+        print("窗口: %s | %s" % (win.Name or "(无标题)", win.ControlTypeName))
+        n = 0
+        for d, c in _uia_walk(win, a.depth):
+            try:
+                cn = c.ControlTypeName
+                if a.interactive and cn not in INTERACTIVE_TYPES:
+                    continue
+                r = c.BoundingRectangle
+                w, h = r.right - r.left, r.bottom - r.top
+                if w <= 0 or h <= 0:
+                    continue
+                print("%s%-18s %-38s (%d,%d %dx%d)"
+                      % ("  " * min(d, 10), cn, (c.Name or "")[:36],
+                         r.left, r.top, w, h))
+                n += 1
+            except Exception:
+                continue
+        print("共 %d 个元素" % n)
+
+    elif a.cmd == "find":
+        if uia() is None:
+            print("需要可选依赖：pip install uiautomation")
+            sys.exit(6)
+        if not (a.name or a.ctype or a.auto_id):
+            print("至少给一个条件：--name / --type / --auto-id")
+            sys.exit(2)
+        hits, err = _uia_find(a.win, a.process, a.cls, a.name, a.ctype,
+                              a.auto_id, not a.exact, a.limit)
+        if err:
+            print("✗", err)
+            sys.exit(3)
+        if not hits:
+            print("(没找到匹配元素)")
+            sys.exit(3)
+        print("找到 %d 个：" % len(hits))
+        for i, h in enumerate(hits):
+            print("  [%d] %s" % (i, _uia_describe(h)))
+
+    elif a.cmd in ("click-el", "set-el"):
+        if uia() is None:
+            print("需要可选依赖：pip install uiautomation")
+            sys.exit(6)
+        if not (a.name or a.ctype or a.auto_id):
+            print("至少给一个定位条件：--name / --type / --auto-id")
+            sys.exit(2)
+        hits, err = _uia_find(a.win, a.process, a.cls, a.name, a.ctype,
+                              a.auto_id, not a.exact, 50)
+        if err:
+            print("✗", err)
+            sys.exit(3)
+        if not hits:
+            print("✗ 没找到匹配元素，拒绝盲点。请先用 find 看看有什么。")
+            sys.exit(3)
+        if a.index >= len(hits):
+            print("✗ --index %d 越界，只找到 %d 个" % (a.index, len(hits)))
+            sys.exit(2)
+        h = hits[a.index]
+        if len(hits) > 1:
+            print("命中 %d 个，取第 %d 个：" % (len(hits), a.index))
+        print("  目标: %s" % _uia_describe(h))
+
+        # 元素定位的最大价值：先把窗口激活，再按元素中心点击
+        win, _ = _uia_window(a.win, a.process, a.cls)
+        if win is not None:
+            try:
+                force_foreground(int(win.NativeWindowHandle))
+            except Exception:
+                pass
+            time.sleep(0.35)
+
+        if dry:
+            print("[dry-run] 将点击 (%d,%d)" % (h["cx"], h["cy"]))
+            return
+
+        click("left", h["cx"], h["cy"], 1 if a.cmd == "click-el" else 1)
+        time.sleep(0.35)
+
+        if a.cmd == "click-el":
+            print("已点击元素中心 (%d,%d)" % (h["cx"], h["cy"]))
+        else:
+            if a.clear:
+                hotkey(["ctrl", "a"])
+                time.sleep(0.25)
+                press_key("delete")
+                time.sleep(0.25)
+            if a.paste:
+                type_via_clipboard(a.text)
+                print("已向元素粘贴 %d 字符" % len(a.text))
+            else:
+                type_text(a.text)
+                print("已向元素输入 %d 字符" % len(a.text))
 
 
 if __name__ == "__main__":

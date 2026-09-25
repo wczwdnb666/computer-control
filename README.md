@@ -30,6 +30,34 @@ I built this for that case, and I built it around the specific ways it goes wron
 
 **Robots move like robots.** Perfectly straight, constant-velocity motion looks wrong in a recording and is trivial to detect. So the default path is deliberately imperfect.
 
+## Two ways to drive an app: find the element, or aim at pixels
+
+**Element targeting comes first. Coordinates are the fallback.**
+
+Pixels are brittle. A window moves and every coordinate is wrong. A page scrolls and every coordinate is wrong. The display scale changes, the UI language changes, a toolbar appears — all of it invalidates a position you measured thirty seconds ago.
+
+Windows UI Automation doesn't care about any of that. It sees controls by *name* and *type*:
+
+```bash
+python cc.py tree --process notepad --interactive     # what's in this window?
+python cc.py find --win notepad --type EditControl    # locate the editor
+python cc.py set-el "hello" --win notepad --type EditControl --paste
+```
+
+`click-el` and `set-el` **refuse to act if they can't locate the element**. There is no "close enough" fallback that clicks whatever happens to be at those coordinates. That refusal is the whole point.
+
+Coordinates still matter, because UI Automation can't see everything:
+
+| Situation | Why | What to use |
+|---|---|---|
+| Games, canvas-drawn UIs | The whole screen is one control with nothing inside | coordinates |
+| Electron apps (Bilibili, Discord, VS Code) | Chromium doesn't expose its internals to UIA by default | coordinates, or enable the app's accessibility support |
+| Old apps with custom-drawn widgets | The author never implemented a UIA provider | coordinates |
+
+Quick test: run `tree --process <app>`. If it lists one or two elements, that app doesn't expose its internals — switch to coordinates.
+
+Element targeting needs an optional dependency, `pip install uiautomation`. Without it, the core toolkit is unchanged and still zero-dependency; only the four element commands report the missing package.
+
 ## What it does
 
 ### Looking
