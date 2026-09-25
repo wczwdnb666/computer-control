@@ -367,6 +367,32 @@ def scroll(amount, x=None, y=None, move_ms=420, human=True):
     _send(_mouse(MOUSEEVENTF_WHEEL, data=(int(amount) * 120) & 0xFFFFFFFF))
 
 
+def type_via_clipboard(text, restore=True, settle=0.22):
+    """走剪贴板粘贴，而不是逐字符模拟按键。
+
+    为什么需要这个：SendInput 批量提交对浏览器/Electron 应用太快，
+    会**静默丢字符**（实测 132 字符丢了 2 个）。剪贴板是原子的，
+    无论多长都不会丢。
+
+    代价：会覆盖用户当前剪贴板，所以默认用完恢复。
+    """
+    saved = None
+    if restore:
+        try:
+            saved = clip_get()
+        except Exception:
+            saved = None
+    clip_set(text)
+    time.sleep(0.12)
+    hotkey(["ctrl", "v"])
+    time.sleep(settle)
+    if restore and saved is not None:
+        try:
+            clip_set(saved)
+        except Exception:
+            pass
+
+
 def type_text(text, interval_ms=1, chunk=30):
     events = []
     for ch in text:
@@ -760,6 +786,13 @@ def main():
     p.add_argument("text")
     p.add_argument("--interval", type=int, default=1)
     p.add_argument("--chunk", type=int, default=30)
+    p.add_argument("--paste", action="store_true",
+                   help="走剪贴板粘贴。文本较长或目标应用会丢字符时用这个")
+    p.add_argument("--no-restore", action="store_true",
+                   help="配合 --paste：不恢复原剪贴板内容")
+    p.add_argument("--require", metavar="PROCESS",
+                   help="硬闸：前台进程名必须匹配才允许输入，否则拒绝执行。"
+                        "强烈建议始终加上，防止文字打进错误的窗口")
 
     p = sub.add_parser("key", help="按单键")
     p.add_argument("name")
@@ -854,7 +887,9 @@ def main():
             return
         region = None
         if a.region:
-            region = tuple(int(v) for v in a.region.split(","))
+            # --region 收的是 x,y,w,h；PIL 的 bbox 要的是 left,top,right,bottom
+            rx, ry, rw, rh = (int(v) for v in a.region.split(","))
+            region = (rx, ry, rx + rw, ry + rh)
         else:
             w = resolve_win()
             if w:
@@ -963,10 +998,23 @@ def main():
         h = u32.GetForegroundWindow()
         pid = wintypes.DWORD()
         u32.GetWindowThreadProcessId(h, ctypes.byref(pid))
-        print("目标窗口: %s | %s" % (proc_name(pid.value), win_title(h) or "(无标题)"))
+        pname = proc_name(pid.value)
+        wtitle = win_title(h)
+        if a.require:
+            if a.require.lower() not in pname.lower():
+                print("✗ 前台进程是「%s」，与 --require「%s」不符，拒绝输入。"
+                      % (pname, a.require))
+                print("  当前窗口标题: %s" % (wtitle or "(无标题)"))
+                sys.exit(5)
+            print("前台校验通过: %s ✓" % pname)
+        print("目标窗口: %s | %s" % (pname, wtitle or "(无标题)"))
         t0 = time.time()
-        type_text(a.text, a.interval, a.chunk)
-        print("已输入 %d 字符，耗时 %.3fs" % (len(a.text), time.time() - t0))
+        if a.paste:
+            type_via_clipboard(a.text, restore=not a.no_restore)
+            print("已粘贴 %d 字符（走剪贴板），耗时 %.3fs" % (len(a.text), time.time() - t0))
+        else:
+            type_text(a.text, a.interval, a.chunk)
+            print("已输入 %d 字符，耗时 %.3fs" % (len(a.text), time.time() - t0))
 
     elif a.cmd == "key":
         if dry:
